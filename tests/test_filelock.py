@@ -4,14 +4,16 @@ import errno
 import inspect
 import logging
 import os
+import subprocess  # noqa: S404  # only fixed-argument, no-shell icacls runs below
 import sys
 import threading
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from errno import ENOSYS
+from errno import EIO, ENOSYS, EWOULDBLOCK
 from inspect import getframeinfo, stack
 from pathlib import Path, PurePath
-from stat import S_IWGRP, S_IWOTH, S_IWUSR, filemode
+from stat import S_IMODE, S_ISVTX, S_IWGRP, S_IWOTH, S_IWUSR, filemode
 from types import TracebackType
 from typing import TYPE_CHECKING, Callable, Iterator, Tuple, Type, Union
 from uuid import uuid4
@@ -704,3 +706,129 @@ def test_unix_symlink_lock_file_not_followed(tmp_path: Path, target_exists: bool
         assert target.read_text(encoding="utf-8") == "sensitive"
     else:
         assert not target.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock not run on windows")
+@pytest.mark.parametrize("mode", [pytest.param(None, id="default-mode"), pytest.param(0o666, id="explicit-mode")])
+def test_winner_leaves_existing_file_as_found(tmp_path: Path, mode: int | None) -> None:
+    journal = tmp_path / "journal.log"
+    journal.write_text("data", encoding="utf-8")
+    journal.chmod(0o600)
+    # A regular file with one name is indistinguishable from a lock file an earlier holder left.
+    lock_path = tmp_path / "resource.lock"
+    journal.rename(lock_path)
+
+    with FileLock(lock_path, timeout=0) if mode is None else FileLock(lock_path, timeout=0, mode=mode):
+        assert (lock_path.read_text(encoding="utf-8"), S_IMODE(lock_path.stat().st_mode)) == ("data", 0o600)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock not run on windows")
+def test_creator_that_loses_the_flock_applies_mode(tmp_path: Path, mocker: MockerFixture) -> None:
+    lock_path = tmp_path / "resource.lock"
+    # A peer may win the flock first, and only the creator may set the mode.
+    mocker.patch("filelock._unix.fcntl.flock", side_effect=OSError(EWOULDBLOCK, "Resource temporarily unavailable"))
+
+    initial_umask = os.umask(0o077)
+    try:
+        with pytest.raises(Timeout):
+            FileLock(lock_path, timeout=0, mode=0o666).acquire()
+    finally:
+        os.umask(initial_umask)
+
+    assert S_IMODE(lock_path.stat().st_mode) == 0o666
+
+
+# The upstream test also has an "fstat" case: there the winner fstats the locked descriptor to check its link count,
+# a step this version's acquire does not have, so only the fchmod a creator runs after the open can fail here.
+@pytest.mark.skipif(sys.platform == "win32", reason="flock not run on windows")
+@pytest.mark.parametrize("failing", [pytest.param("fchmod", id="fchmod")])
+def test_post_open_failure_closes_fd(tmp_path: Path, mocker: MockerFixture, failing: str) -> None:
+    mocker.patch(f"os.{failing}", side_effect=OSError(EIO, "Input/output error"))
+    open_spy = mocker.spy(os, "open")
+    close_spy = mocker.spy(os, "close")
+
+    with pytest.raises(OSError, match="Input/output error"):
+        FileLock(tmp_path / "resource.lock", timeout=0, mode=0o644).acquire()
+
+    assert any(call[0] and call[0][0] == open_spy.spy_return for call in close_spy.call_args_list)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock not run on windows")
+def test_fchmod_enosys_is_not_a_missing_flock(tmp_path: Path, mocker: MockerFixture) -> None:
+    mocker.patch("os.fchmod", side_effect=OSError(ENOSYS, "Function not implemented"))
+    lock = UnixFileLock(tmp_path / "test.lock", mode=0o644)
+
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        with pytest.raises(OSError, match="Function not implemented"):
+            lock.acquire()
+
+    assert not recorded
+    assert not lock.is_locked
+
+
+def _icacls(path: Path, *args: str) -> bytes:  # pragma: win32 cover
+    icacls = Path(os.environ["SYSTEMROOT"], "System32", "icacls.exe")
+    return subprocess.run([str(icacls), str(path), *args], capture_output=True, check=True).stdout  # noqa: S603
+
+
+@pytest.fixture()
+def inheriting_directory(tmp_path: Path) -> Path:  # pragma: win32 cover
+    # A directory whose ACL has no inheritable entry hands a new file the token's default DACL, which icacls cannot
+    # tell from an explicit one, so grant Users an inheritable entry for the file to show as (I).
+    directory = tmp_path / "inheriting"
+    directory.mkdir()
+    _icacls(directory, "/grant", "*S-1-5-32-545:(OI)(CI)(RX)")
+    return directory
+
+
+@WindowsOnly
+@pytest.mark.parametrize(
+    ("mode", "inherits"),
+    [
+        pytest.param(None, True, id="unset"),
+        pytest.param(0o644, True, id="others-read"),
+        pytest.param(0o666, True, id="others-write"),
+        pytest.param(0o600, False, id="owner-only"),
+    ],
+)
+def test_windows_owner_only_mode_keeps_out_the_directory_acl(
+    inheriting_directory: Path,
+    mode: int | None,
+    *,
+    inherits: bool,
+) -> None:
+    lock_path = inheriting_directory / "a"
+    with FileLock(str(lock_path)) if mode is None else FileLock(str(lock_path), mode=mode):
+        acl = _icacls(lock_path)
+    assert (b"(I)" in acl) is inherits  # icacls marks inherited entries with (I) in every display language
+
+
+def _foreign_sticky_tmp() -> bool:
+    if sys.platform == "win32":
+        return False
+    tmp = Path("/tmp").stat()  # noqa: S108  # the shared sticky directory is the subject
+    return bool(tmp.st_mode & S_ISVTX) and tmp.st_uid != os.geteuid()
+
+
+@pytest.mark.skipif(
+    not _foreign_sticky_tmp(),
+    reason="a node of another account is refused only under a sticky parent this account does not own",
+)
+def test_lock_file_of_another_account_under_sticky_parent_is_refused(mocker: MockerFixture) -> None:
+    # /tmp itself, where every account can create names, rather than this test's own directory.
+    lock_path = Path("/tmp", f"filelock-{uuid4().hex}.lock")  # noqa: S108  # the subject
+    try:
+        # Its owner could unlink it during the hold, letting a second process lock a new file at the same path.
+        lock_path.touch()
+        if sys.platform != "win32":  # pragma: no branch  # skipped there; narrows os.geteuid for the type checker
+            # The file this process created then looks, to the lock, like one another account created first.
+            mocker.patch("filelock._unix.os.geteuid", autospec=True, return_value=os.geteuid() + 1)
+        lock = FileLock(str(lock_path), timeout=0)
+
+        with pytest.raises(PermissionError, match="not to this process's account") as raised:
+            lock.acquire()
+        assert (raised.value.filename, lock.is_locked, lock_path.exists()) == (str(lock_path), False, True)
+    finally:
+        if lock_path.exists():
+            lock_path.unlink()
